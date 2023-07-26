@@ -9,4 +9,4 @@ COPY . .
 
 RUN yarn install && yarn cache clean
 
-CMD [ "node" ]
+CMD [ "node", "index.js" ]
