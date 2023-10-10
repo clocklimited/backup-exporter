@@ -80,11 +80,13 @@ const s3Bucket = process.env.S3_BUCKET
   }
   console.log(`Got backup ${backupToExport.id}`, backupToExport)
   console.log('Getting download link')
-  const { downloadLink } = (
+  const download = (
     await apiClient.get.addon.backup.download({
       parameters: { projectId, addonId, backupId: backupToExport.id }
     })
-  ).data
+  )
+  console.log('Download API response', download)
+  const { downloadLink } = download.data
   console.log('Download link:', downloadLink)
   console.log('Streaming backup to AWS')
 
