@@ -36,7 +36,7 @@ const s3Bucket = process.env.S3_BUCKET
 
   try {
     console.log('Validating AWS credentials')
-    await s3.headBucket({ Bucket: s3Bucket }).promise()
+    await s3.listObjectsV2({ Bucket: s3Bucket }).promise()
   } catch (error) {
     console.error('No access to s3 bucket', error)
     process.exit(1)
