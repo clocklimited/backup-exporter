@@ -1,12 +1,14 @@
-FROM node:18.16.0-alpine AS base
+FROM node:24-alpine
 
-RUN apk add --update curl git build-base \
-  && rm -rf /var/cache/apk/*
-
+ENV NODE_ENV=production
 WORKDIR /app
 
-COPY . .
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-RUN yarn install && yarn cache clean
+COPY --chown=node:node index.js ./
+COPY --chown=node:node src ./src
+COPY --chown=node:node scripts ./scripts
 
+USER node
 CMD [ "node", "index.js" ]
