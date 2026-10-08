@@ -9,8 +9,7 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test",
-    "format:check": "prettier --check .",
-    "verify": "node scripts/verify-backup.js"
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1147.0",

@@ -1,7 +1,11 @@
 import dotenv from 'dotenv'
-import { readConfig } from './src/config.js'
 import { createNorthflankClient } from './src/northflank.js'
-import { createS3Client, exportAddons, safeError } from './src/exporter.js'
+import {
+  readConfig,
+  createS3Client,
+  exportAddons,
+  safeError
+} from './src/exporter.js'
 
 dotenv.config({ quiet: true })
 

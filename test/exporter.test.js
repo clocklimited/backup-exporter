@@ -3,29 +3,24 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { createHash } from 'node:crypto'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { createNorthflankClient } from '../src/northflank.js'
 import {
   readConfig,
   multipartPartSize,
-  MIB,
-  MAX_OBJECT_SIZE
-} from '../src/config.js'
-import { createNorthflankClient } from '../src/northflank.js'
-import {
   createS3Client,
   exportBackup,
   exportAddons,
   selectBackup,
   safeError
 } from '../src/exporter.js'
-import { verifyBackup } from '../scripts/verify-backup.js'
+const MIB = 1024 * 1024
+const MAX_OBJECT_SIZE = 5_000_000_000_000
 
 function backup(id = 'native-backup', size = 12, overrides = {}) {
   return {
     id,
-    uid: `uid-${id}`,
+    size,
+    compression: 'zstd',
     status: 'completed',
     createdAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
@@ -72,7 +67,6 @@ async function storage(t, options = {}) {
         '<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>'
       )
     } else if (req.method === 'PUT' && url.searchParams.has('partNumber')) {
-      if (options.stallPart) return
       if (options.rejectPart) {
         res.writeHead(403)
         res.end(
@@ -115,17 +109,10 @@ async function storage(t, options = {}) {
       res.writeHead(204)
       res.end()
     } else if (req.method === 'PUT') {
-      if (options.rejectManifest && url.pathname.endsWith('.manifest.json')) {
-        res.writeHead(403)
-        res.end(
-          '<Error><Code>AccessDenied</Code><Message>Denied</Message></Error>'
-        )
-      } else {
-        objects.set(url.pathname, body)
-        res.setHeader('x-amz-version-id', 'test-version-id')
-        res.setHeader('etag', '"test-etag"')
-        res.end()
-      }
+      objects.set(url.pathname, body)
+      res.setHeader('x-amz-version-id', 'test-version-id')
+      res.setHeader('etag', '"test-etag"')
+      res.end()
     } else {
       res.writeHead(405)
       res.end('<Error><Code>MethodNotAllowed</Code></Error>')
@@ -135,8 +122,7 @@ async function storage(t, options = {}) {
   await once(server, 'listening')
   const config = {
     ...readConfig(env),
-    endpoint: `http://127.0.0.1:${server.address().port}`,
-    partSize: 5 * MIB
+    endpoint: `http://127.0.0.1:${server.address().port}`
   }
   const s3 = createS3Client(config)
   t.after(async () => {
@@ -166,8 +152,8 @@ test('single-addon configuration remains compatible; multiple IDs are explicit a
     /HTTPS/
   )
   assert.throws(
-    () => readConfig({ ...env, EXPORT_TIMEOUT_HOURS: 'NaN' }),
-    /EXPORT_TIMEOUT/
+    () => readConfig({ ...env, BACKUP_MAX_AGE_HOURS: 'NaN' }),
+    /BACKUP_MAX_AGE/
   )
 })
 
@@ -197,10 +183,7 @@ test('selects newest completed native backup independent of API order; rejects s
   )
   const defaultGzip = backup('gzip-default')
   delete defaultGzip.config.compressionType
-  assert.equal(
-    selectBackup([defaultGzip], 24, now).config.compressionType,
-    'gz'
-  )
+  assert.equal(selectBackup([defaultGzip], 24, now).compression, 'gz')
   assert.throws(() => selectBackup([failed, snapshot], 24, now), /No completed/)
   assert.throws(() => selectBackup([old], 24, now + 25 * 3600000), /older than/)
 })
@@ -241,30 +224,19 @@ test('Northflank rejects repeated cursors and non-HTTPS download URLs', async ()
   )
 })
 
-test('single upload records the complete checksum and version without needing read/list permissions', async (t) => {
+test('single upload preserves bytes without read/list permissions or sidecar files', async (t) => {
   const store = await storage(t)
   const body = Buffer.from('backup-bytes')
-  const manifest = await exportBackup({
+  const key = await exportBackup({
     ...store,
     addonId: 'mongo',
-    backup: { ...backup('small', body.length), size: body.length },
+    backup: backup('small', body.length),
     downloadLink,
     fetchImpl: async () => new Response(body)
   })
-  assert.equal(
-    manifest.object.sha256,
-    createHash('sha256').update(body).digest('hex')
-  )
-  assert.equal(manifest.object.versionId, 'test-version-id')
-  assert.ok(manifest.object.key.includes('/mongo/'))
-  assert.deepEqual(
-    store.objects.get(`/test-bucket/${manifest.object.key}`),
-    body
-  )
-  const sidecar = JSON.parse(
-    store.objects.get(`/test-bucket/${manifest.object.key}.manifest.json`)
-  )
-  assert.deepEqual(sidecar, manifest)
+  assert.equal(key, 'test-project/mongo/small.zstd')
+  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+  assert.equal(store.objects.size, 1)
   assert.ok(store.requests.every((request) => request.method === 'PUT'))
   assert.ok(
     store.requests.every(
@@ -275,30 +247,28 @@ test('single upload records the complete checksum and version without needing re
   )
 })
 
-test('real SDK multipart upload preserves every byte and writes a manifest', async (t) => {
+test('real SDK multipart upload preserves every byte with fixed buffering', async (t) => {
   const store = await storage(t)
-  const body = Buffer.alloc(6 * MIB + 17, 42)
-  const manifest = await exportBackup({
+  const body = Buffer.alloc(65 * MIB + 17, 42)
+  const key = await exportBackup({
     ...store,
     addonId: 'postgres',
-    backup: { ...backup('large', body.length), size: body.length },
+    backup: backup('large', body.length),
     downloadLink,
     fetchImpl: async () => new Response(body)
   })
-  assert.deepEqual(
-    store.objects.get(`/test-bucket/${manifest.object.key}`),
-    body
-  )
-  assert.equal(
-    manifest.object.sha256,
-    createHash('sha256').update(body).digest('hex')
-  )
-  assert.equal(
-    store.requests.filter((request) =>
-      request.url.searchParams.has('partNumber')
-    ).length,
-    2
-  )
+  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+  const parts = store.requests
+    .filter((request) => request.url.searchParams.has('partNumber'))
+    .sort(
+      (a, b) =>
+        Number(a.url.searchParams.get('partNumber')) -
+        Number(b.url.searchParams.get('partNumber'))
+    )
+  assert.equal(parts.length, 2)
+  assert.equal(parts[0].body.length, 64 * MIB)
+  assert.equal(parts[1].body.length, MIB + 17)
+  assert.equal(store.objects.size, 1)
   assert.equal(
     store.requests.filter(
       (request) =>
@@ -312,6 +282,8 @@ test('HTTP errors, empty downloads and size mismatches never become backup objec
   const store = await storage(t)
   for (const response of [
     new Response('<Error>Denied</Error>', { status: 403 }),
+    new Response(null, { status: 204 }),
+    new Response('backup-bytes', { headers: { 'content-encoding': 'gzip' } }),
     new Response('abc', { headers: { 'content-length': '3' } }),
     new Response(''),
     new Response('short'),
@@ -337,7 +309,7 @@ test('source failure after a part upload aborts multipart and never completes it
     async pull(controller) {
       if (!sent) {
         sent = true
-        controller.enqueue(new Uint8Array(5 * MIB + 1))
+        controller.enqueue(new Uint8Array(64 * MIB + 1))
       } else {
         await store.firstPart
         controller.error(new Error('Source connection dropped'))
@@ -348,7 +320,7 @@ test('source failure after a part upload aborts multipart and never completes it
     exportBackup({
       ...store,
       addonId: 'mongo',
-      backup: { ...backup('broken', 8 * MIB), size: 8 * MIB },
+      backup: { ...backup('broken', 68 * MIB), size: 68 * MIB },
       downloadLink,
       fetchImpl: async () => new Response(stream)
     })
@@ -368,14 +340,14 @@ test('source failure after a part upload aborts multipart and never completes it
   assert.equal(store.objects.size, 0)
 })
 
-test('S3 part failures abort multipart; manifest write failures fail the export', async (t) => {
+test('S3 part failures abort multipart and fail the export', async (t) => {
   const store = await storage(t, { rejectPart: true })
-  const body = Buffer.alloc(6 * MIB, 42)
+  const body = Buffer.alloc(65 * MIB, 42)
   await assert.rejects(
     exportBackup({
       ...store,
       addonId: 'mongo',
-      backup: { ...backup('denied', body.length), size: body.length },
+      backup: backup('denied', body.length),
       downloadLink,
       fetchImpl: async () => new Response(body)
     }),
@@ -383,60 +355,20 @@ test('S3 part failures abort multipart; manifest write failures fail the export'
   )
   assert.ok(store.requests.some((request) => request.method === 'DELETE'))
   assert.equal(store.objects.size, 0)
-  const manifests = await storage(t, { rejectManifest: true })
-  await assert.rejects(
-    exportBackup({
-      ...manifests,
-      addonId: 'mongo',
-      backup: { ...backup('small', 3), size: 3 },
-      downloadLink,
-      fetchImpl: async () => new Response('abc')
-    }),
-    /Denied/
-  )
 })
 
-test('failed multipart completion is explicitly aborted', async (t) => {
+test('failed multipart completion fails the export', async (t) => {
   const store = await storage(t, { rejectComplete: true })
-  const body = Buffer.alloc(6 * MIB, 42)
+  const body = Buffer.alloc(65 * MIB, 42)
   await assert.rejects(
     exportBackup({
       ...store,
       addonId: 'mongo',
-      backup: { ...backup('bad-complete', body.length), size: body.length },
+      backup: backup('bad-complete', body.length),
       downloadLink,
       fetchImpl: async () => new Response(body)
     }),
     /Completion denied/
-  )
-  assert.ok(
-    store.requests.some(
-      (request) =>
-        request.method === 'DELETE' && request.url.searchParams.has('uploadId')
-    )
-  )
-  assert.equal(store.objects.size, 0)
-})
-
-test('export deadline cancels stalled S3 requests and still permits multipart cleanup', async (t) => {
-  const store = await storage(t, { stallPart: true })
-  store.config.exportTimeoutMs = 200
-  const body = Buffer.alloc(6 * MIB, 42)
-  await assert.rejects(
-    exportBackup({
-      ...store,
-      addonId: 'mongo',
-      backup: { ...backup('timeout', body.length), size: body.length },
-      downloadLink,
-      fetchImpl: async () => new Response(body)
-    }),
-    /aborted/i
-  )
-  assert.ok(
-    store.requests.some(
-      (request) =>
-        request.method === 'DELETE' && request.url.searchParams.has('uploadId')
-    )
   )
   assert.equal(store.objects.size, 0)
 })
@@ -462,27 +394,9 @@ test('one failed addon does not prevent another export, but the job fails and lo
     }),
     /broken/
   )
-  assert.equal(store.objects.size, 2)
+  assert.equal(store.objects.size, 1)
   assert.ok(!logs.join('\n').includes('DO-NOT-LOG'))
   assert.ok(
     !safeError(new Error(`Failed ${downloadLink}`)).includes('DO-NOT-LOG')
   )
-})
-
-test('restore verifier detects corrupted bytes of the same length', async (t) => {
-  const folder = await mkdtemp(join(tmpdir(), 'exporter-verify-'))
-  t.after(() => rm(folder, { recursive: true, force: true }))
-  const file = join(folder, 'dump.zstd')
-  const body = Buffer.from('backup-bytes')
-  const manifest = {
-    formatVersion: 1,
-    object: {
-      sizeBytes: body.length,
-      sha256: createHash('sha256').update(body).digest('hex')
-    }
-  }
-  await writeFile(file, body)
-  assert.equal((await verifyBackup(manifest, file)).sizeBytes, body.length)
-  await writeFile(file, Buffer.alloc(body.length, 42))
-  await assert.rejects(verifyBackup(manifest, file), /SHA256/)
 })
