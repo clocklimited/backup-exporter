@@ -357,6 +357,86 @@ test('S3 part failures abort multipart and fail the export', async (t) => {
   assert.equal(store.objects.size, 0)
 })
 
+test(
+  'a rejected upload part cancels a stalled download and allows the next addon to export',
+  { timeout: 10000 },
+  async (t) => {
+    const store = await storage(t, { rejectPart: true })
+    store.config.addonIds = ['large', 'small']
+    let controller
+    let cancelled = false
+    const stream = new ReadableStream({
+      start(value) {
+        controller = value
+        controller.enqueue(new Uint8Array(65 * MIB))
+        // Leave the download open without providing a second complete part.
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+    t.after(() => controller.error(new Error('Test cleanup')))
+    const visited = []
+    const errors = []
+    const finished = assert.rejects(
+      exportAddons({
+        ...store,
+        northflank: {
+          async listBackups(project, addon) {
+            visited.push(addon)
+            return [backup(addon, addon === 'large' ? 400 * 1024 ** 3 : 3)]
+          },
+          downloadLink: async (project, addon) =>
+            `https://storage.example.invalid/${addon}`
+        },
+        fetchImpl: async (url) =>
+          new Response(url.endsWith('/large') ? stream : 'abc'),
+        logger: { log() {}, error: (message) => errors.push(message) }
+      }),
+      /large/
+    )
+    await store.firstPart
+    // Release the source if the exporter is stuck, so a regression fails cleanly.
+    let forcedEnd = false
+    const watchdog = setTimeout(() => {
+      forcedEnd = true
+      controller.error(
+        new Error('Download was not cancelled after upload failure')
+      )
+    }, 3000)
+    try {
+      await finished
+    } finally {
+      clearTimeout(watchdog)
+    }
+    assert.equal(forcedEnd, false, 'The exporter waited for the stalled source')
+    assert.equal(cancelled, true)
+    assert.deepEqual(visited, ['large', 'small'])
+    assert.ok(errors.some((message) => message.includes('Denied')))
+    assert.deepEqual(
+      store.objects.get('/test-bucket/test-project/small/small.zstd'),
+      Buffer.from('abc')
+    )
+    assert.equal(store.objects.size, 1)
+    const aborted = store.requests.findIndex(
+      (request) => request.method === 'DELETE'
+    )
+    const nextUpload = store.requests.findIndex((request) =>
+      request.url.pathname.endsWith('/small.zstd')
+    )
+    assert.ok(
+      aborted >= 0 && aborted < nextUpload,
+      'Multipart cleanup must precede the next export'
+    )
+    assert.ok(
+      !store.requests.some(
+        (request) =>
+          request.method === 'POST' && request.url.searchParams.has('uploadId')
+      )
+    )
+  }
+)
+
 test('failed multipart completion fails the export', async (t) => {
   const store = await storage(t, { rejectComplete: true })
   const body = Buffer.alloc(65 * MIB, 42)

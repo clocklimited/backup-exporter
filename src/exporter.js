@@ -135,7 +135,18 @@ export async function exportBackup({
     .join('/')
   try {
     const upload = new Upload({
-      client: s3,
+      client: {
+        config: s3.config,
+        async send(command) {
+          try {
+            return await s3.send(command)
+          } catch (error) {
+            // Release multipart workers waiting for more download bytes.
+            source.destroy(error)
+            throw error
+          }
+        }
+      },
       queueSize: 2,
       partSize: multipartPartSize(backup.size),
       leavePartsOnError: false,
