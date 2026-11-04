@@ -304,7 +304,7 @@ test('single upload preserves bytes without read/list permissions or sidecar fil
     downloadLink,
     fetchImpl: async () => new Response(body)
   })
-  assert.equal(key, 'test-project/mongo/small.zstd')
+  assert.equal(key, 'test-project/mongo/small.zst')
   assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
   assert.equal(store.objects.size, 1)
   assert.ok(store.requests.every((request) => request.method === 'PUT'))
@@ -514,7 +514,7 @@ test(
     assert.deepEqual(visited, ['large', 'small'])
     assert.ok(errors.some((message) => message.includes('Denied')))
     assert.deepEqual(
-      store.objects.get('/test-bucket/test-project/small/small.zstd'),
+      store.objects.get('/test-bucket/test-project/small/small.zst'),
       Buffer.from('abc')
     )
     assert.equal(store.objects.size, 1)
@@ -522,7 +522,7 @@ test(
       (request) => request.method === 'DELETE'
     )
     const nextUpload = store.requests.findIndex((request) =>
-      request.url.pathname.endsWith('/small.zstd')
+      request.url.pathname.endsWith('/small.zst')
     )
     assert.ok(
       aborted >= 0 && aborted < nextUpload,

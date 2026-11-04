@@ -49,7 +49,7 @@ Objects are stored as:
 project-id/addon-id/backup-id.gz
 ```
 
-Zstandard backups use `.zstd`. Re-exporting the same backup uses the same key and creates another version if bucket versioning is enabled.
+Zstandard backups use `.zst`. Re-exporting the same backup uses the same key and creates another version if bucket versioning is enabled.
 
 To restore, download the required object version and import it with the database's native restore tools. Test an upload and restore on a small database before relying on the job.
 

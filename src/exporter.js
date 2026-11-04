@@ -161,7 +161,8 @@ export async function exportBackup({
     if (bytes !== backup.size) throw new Error('Download is empty or truncated')
   }
   const body = Readable.from(checkedDownload())
-  const key = [config.projectId, addonId, `${backup.id}.${backup.compression}`]
+  const extension = backup.compression === 'zstd' ? 'zst' : backup.compression
+  const key = [config.projectId, addonId, `${backup.id}.${extension}`]
     .map(encodeURIComponent)
     .join('/')
   try {
