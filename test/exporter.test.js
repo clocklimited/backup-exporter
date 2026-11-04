@@ -224,6 +224,74 @@ test('Northflank rejects repeated cursors and non-HTTPS download URLs', async ()
   )
 })
 
+test('Northflank timeout identifies the project, addon and failed page without logging credentials', async () => {
+  const logs = []
+  let calls = 0
+  const nf = createNorthflankClient(
+    'fake-token',
+    async () => {
+      if (++calls === 1) {
+        return json({
+          data: { backups: [backup('old')] },
+          pagination: { hasNextPage: true, cursor: 'private-cursor' }
+        })
+      }
+      throw new DOMException(`fake-token ${downloadLink}`, 'TimeoutError')
+    },
+    { log: (message) => logs.push(message) }
+  )
+  await assert.rejects(
+    nf.listBackups('bbfc', 'production-database'),
+    /timed out after 30 seconds.*list backups for bbfc\/production-database \(page 2\)/
+  )
+  assert.equal(calls, 2)
+  assert.equal(logs.length, 2)
+  assert.match(logs[0], /bbfc\/production-database \(page 1\)/)
+  assert.match(logs[1], /bbfc\/production-database \(page 2\)/)
+  assert.doesNotMatch(logs.join(' '), /fake-token|private-cursor|DO-NOT-LOG/)
+})
+
+test('Northflank connection failures expose an error code without leaking the original error', async () => {
+  const logs = []
+  const nf = createNorthflankClient(
+    'fake-token',
+    async () => {
+      throw new TypeError(`fake-token ${downloadLink}`, {
+        cause: Object.assign(new Error(downloadLink), { code: 'ENOTFOUND' })
+      })
+    },
+    { log: (message) => logs.push(message) }
+  )
+  await assert.rejects(
+    nf.listBackups('bbfc', 'production-database'),
+    (error) => {
+      assert.match(error.message, /request failed \(ENOTFOUND\)/)
+      assert.match(error.message, /bbfc\/production-database \(page 1\)/)
+      assert.doesNotMatch(error.message, /fake-token|DO-NOT-LOG/)
+      return true
+    }
+  )
+  assert.doesNotMatch(logs.join(' '), /fake-token|DO-NOT-LOG/)
+})
+
+test('Northflank download-link errors identify the operation and status without logging response content', async () => {
+  const logs = []
+  const nf = createNorthflankClient(
+    'fake-token',
+    async () => new Response(downloadLink, { status: 403 }),
+    { log: (message) => logs.push(message) }
+  )
+  await assert.rejects(
+    nf.downloadLink('bbfc', 'production-database', 'backup'),
+    /HTTP 403.*get backup download link for bbfc\/production-database/
+  )
+  assert.match(
+    logs[0],
+    /get backup download link for bbfc\/production-database/
+  )
+  assert.doesNotMatch(logs.join(' '), /fake-token|DO-NOT-LOG/)
+})
+
 test('single upload preserves bytes without read/list permissions or sidecar files', async (t) => {
   const store = await storage(t)
   const body = Buffer.from('backup-bytes')
