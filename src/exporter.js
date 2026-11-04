@@ -43,7 +43,7 @@ export function readConfig(env) {
 }
 
 export function createS3Client(config) {
-  return new S3Client({
+  const client = new S3Client({
     endpoint: config.endpoint,
     region: config.region,
     credentials: config.credentials,
@@ -51,6 +51,18 @@ export function createS3Client(config) {
     requestChecksumCalculation: 'WHEN_REQUIRED',
     responseChecksumValidation: 'WHEN_REQUIRED'
   })
+  client.middlewareStack.add(
+    (next, context) => async (args) => {
+      const result = await next(args)
+      if (context.commandName === 'CreateMultipartUploadCommand') {
+        // Some S3-compatible stores format this unused lifecycle hint incorrectly.
+        delete result.response?.headers?.['x-amz-abort-date']
+      }
+      return result
+    },
+    { step: 'deserialize', priority: 'low', name: 'ignoreMultipartAbortDate' }
+  )
+  return client
 }
 
 export function safeError(error) {

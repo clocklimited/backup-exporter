@@ -63,6 +63,8 @@ async function storage(t, options = {}) {
     requests.push({ method: req.method, url, body, headers: req.headers })
     res.setHeader('content-type', 'application/xml')
     if (req.method === 'POST' && url.searchParams.has('uploads')) {
+      if (options.abortDate)
+        res.setHeader('x-amz-abort-date', options.abortDate)
       res.end(
         '<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>'
       )
@@ -343,6 +345,25 @@ test('real SDK multipart upload preserves every byte with fixed buffering', asyn
         request.method === 'POST' && request.url.searchParams.has('uploadId')
     ).length,
     1
+  )
+})
+
+test('multipart upload tolerates a non-HTTP cleanup-date header without reading completed objects', async (t) => {
+  const store = await storage(t, {
+    abortDate: '2026-11-11 13:34:12.416636966 +0000 UTC m=+1201882.072403967'
+  })
+  const body = Buffer.alloc(65 * MIB, 42)
+  const key = await exportBackup({
+    ...store,
+    addonId: 'mongo',
+    backup: backup('cleanup-date', body.length),
+    downloadLink,
+    fetchImpl: async () => new Response(body)
+  })
+  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+  assert.deepEqual(
+    store.requests.map((request) => request.method),
+    ['POST', 'PUT', 'PUT', 'POST']
   )
 })
 
