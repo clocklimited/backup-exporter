@@ -66,7 +66,7 @@ async function storage(t, options = {}) {
       if (options.abortDate)
         res.setHeader('x-amz-abort-date', options.abortDate)
       res.end(
-        '<InitiateMultipartUploadResult><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>'
+        `<InitiateMultipartUploadResult>${options.multipartMetadataXml ?? ''}<UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`
       )
     } else if (req.method === 'PUT' && url.searchParams.has('partNumber')) {
       if (options.rejectPart) {
@@ -348,24 +348,35 @@ test('real SDK multipart upload preserves every byte with fixed buffering', asyn
   )
 })
 
-test('multipart upload tolerates a non-HTTP cleanup-date header without reading completed objects', async (t) => {
-  const store = await storage(t, {
-    abortDate: '2026-11-11 13:34:12.416636966 +0000 UTC m=+1201882.072403967'
+const abortDate = '2026-11-11 13:34:12.416636966 +0000 UTC m=+1201882.072403967'
+for (const [location, options] of [
+  ['header', { abortDate }],
+  ['XML body', { multipartMetadataXml: `<AbortDate>${abortDate}</AbortDate>` }],
+  [
+    'header and XML body',
+    {
+      abortDate,
+      multipartMetadataXml: `<AbortDate xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${abortDate}</AbortDate>`
+    }
+  ]
+]) {
+  test(`multipart upload tolerates a non-HTTP cleanup date in the ${location} without object reads`, async (t) => {
+    const store = await storage(t, options)
+    const body = Buffer.alloc(65 * MIB, 42)
+    const key = await exportBackup({
+      ...store,
+      addonId: 'mongo',
+      backup: backup('cleanup-date', body.length),
+      downloadLink,
+      fetchImpl: async () => new Response(body)
+    })
+    assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+    assert.deepEqual(
+      store.requests.map((request) => request.method),
+      ['POST', 'PUT', 'PUT', 'POST']
+    )
   })
-  const body = Buffer.alloc(65 * MIB, 42)
-  const key = await exportBackup({
-    ...store,
-    addonId: 'mongo',
-    backup: backup('cleanup-date', body.length),
-    downloadLink,
-    fetchImpl: async () => new Response(body)
-  })
-  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
-  assert.deepEqual(
-    store.requests.map((request) => request.method),
-    ['POST', 'PUT', 'PUT', 'POST']
-  )
-})
+}
 
 test('HTTP errors, empty downloads and size mismatches never become backup objects', async (t) => {
   const store = await storage(t)

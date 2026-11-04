@@ -54,9 +54,28 @@ export function createS3Client(config) {
   client.middlewareStack.add(
     (next, context) => async (args) => {
       const result = await next(args)
-      if (context.commandName === 'CreateMultipartUploadCommand') {
-        // Some S3-compatible stores format this unused lifecycle hint incorrectly.
-        delete result.response?.headers?.['x-amz-abort-date']
+      const response = result.response
+      if (
+        context.commandName === 'CreateMultipartUploadCommand' &&
+        response?.statusCode === 200
+      ) {
+        // Some stores repeat this unused lifecycle hint in both headers and XML.
+        delete response.headers?.['x-amz-abort-date']
+        if (response.body) {
+          const bytes =
+            typeof response.body === 'string' ||
+            response.body instanceof Uint8Array
+              ? response.body
+              : await client.config.streamCollector(response.body)
+          response.body = Buffer.from(
+            Buffer.from(bytes)
+              .toString('utf8')
+              .replace(
+                /<((?:[\w.-]+:)?AbortDate)\b[^>]*>[\s\S]*?<\/\1\s*>/g,
+                ''
+              )
+          )
+        }
       }
       return result
     },
