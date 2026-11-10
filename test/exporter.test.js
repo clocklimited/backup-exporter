@@ -265,33 +265,38 @@ test('selects newest completed native backup independent of API order; rejects s
   assert.throws(() => selectBackup([old], 24, now + 25 * 3600000), /older than/)
 })
 
-test('Northflank pagination retrieves newer backups beyond the first page', async () => {
+test('Northflank lists only the first 100 backups even when another page exists', async () => {
   const calls = []
   const nf = createNorthflankClient('fake-token', async (url, options) => {
     calls.push(new URL(url))
     assert.equal(options.headers.Authorization, 'Bearer fake-token')
-    return calls.length === 1
-      ? json({
-          data: { backups: [backup('old')] },
-          pagination: { hasNextPage: true, cursor: 'next' }
-        })
-      : json({
-          data: { backups: [backup('new')] },
-          pagination: { hasNextPage: false }
-        })
+    assert.equal(calls.length, 1, 'Must not request historical pages')
+    return json({
+      data: { backups: [backup('first-page')] },
+      pagination: { hasNextPage: true, cursor: 'next' }
+    })
   })
-  assert.equal((await nf.listBackups('project', 'addon')).length, 2)
-  assert.equal(calls[1].searchParams.get('cursor'), 'next')
+  const backups = await nf.listBackups('project', 'addon')
+  assert.deepEqual(
+    backups.map((item) => item.id),
+    ['first-page']
+  )
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].searchParams.get('per_page'), '100')
+  assert.equal(calls[0].searchParams.get('page'), '1')
+  assert.equal(calls[0].searchParams.has('cursor'), false)
+  const expiredAt = Date.parse(backups[0].createdAt) + 25 * 3600000
+  assert.throws(() => selectBackup(backups, 24, expiredAt), /older than/)
 })
 
-test('Northflank rejects repeated cursors and non-HTTPS download URLs', async () => {
+test('Northflank rejects a missing backup list', async () => {
   const nf = createNorthflankClient('fake-token', async () =>
-    json({
-      data: { backups: [] },
-      pagination: { hasNextPage: true, cursor: 'loop' }
-    })
+    json({ data: {} })
   )
-  await assert.rejects(nf.listBackups('project', 'addon'), /repeated/)
+  await assert.rejects(nf.listBackups('project', 'addon'), /missing backups/)
+})
+
+test('Northflank rejects non-HTTPS download URLs', async () => {
   const unsafe = createNorthflankClient('fake-token', async () =>
     json({ data: { downloadLink: 'http://unsafe.example/file' } })
   )
@@ -307,25 +312,19 @@ test('Northflank timeout identifies the project, addon and failed page without l
   const nf = createNorthflankClient(
     'fake-token',
     async () => {
-      if (++calls === 1) {
-        return json({
-          data: { backups: [backup('old')] },
-          pagination: { hasNextPage: true, cursor: 'private-cursor' }
-        })
-      }
+      calls++
       throw new DOMException(`fake-token ${downloadLink}`, 'TimeoutError')
     },
     { log: (message) => logs.push(message) }
   )
   await assert.rejects(
     nf.listBackups('bbfc', 'production-database'),
-    /timed out after 30 seconds.*list backups for bbfc\/production-database \(page 2\)/
+    /timed out after 30 seconds.*list backups for bbfc\/production-database \(page 1\)/
   )
-  assert.equal(calls, 2)
-  assert.equal(logs.length, 2)
+  assert.equal(calls, 1)
+  assert.equal(logs.length, 1)
   assert.match(logs[0], /bbfc\/production-database \(page 1\)/)
-  assert.match(logs[1], /bbfc\/production-database \(page 2\)/)
-  assert.doesNotMatch(logs.join(' '), /fake-token|private-cursor|DO-NOT-LOG/)
+  assert.doesNotMatch(logs.join(' '), /fake-token|DO-NOT-LOG/)
 })
 
 test('Northflank connection failures expose an error code without leaking the original error', async () => {

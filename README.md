@@ -1,6 +1,6 @@
 # backup-exporter
 
-Encrypts the latest completed native database backup from each configured Northflank addon with age and streams it to an S3-compatible bucket. It exports existing backups; it does not create them.
+Encrypts the latest completed native database backup found on the first page for each configured Northflank addon with age and streams it to an S3-compatible bucket. It exports existing backups; it does not create them.
 
 ## Setup
 
@@ -24,7 +24,7 @@ AGE_RECIPIENT=<public-key-from-recipient.txt>
 
 `DATABASE_ADDON_ID` accepts a single addon. If neither addon variable is set, the exporter uses `production-database`. `DATABASE_ADDON_IDS` takes precedence. Omit `S3_ENDPOINT` when using the default AWS S3 endpoint.
 
-The newest backup must be no more than 24 hours old. Set `BACKUP_MAX_AGE_HOURS` to change this, for example `192` for weekly backups.
+The exporter requests only page 1, with up to 100 backups, and selects the newest completed native backup from those results. It fails if that page contains no eligible backup or the selected backup is more than 24 hours old; it does not search older pages. Set `BACKUP_MAX_AGE_HOURS` to change the age limit, for example `192` for weekly backups.
 
 Run with:
 

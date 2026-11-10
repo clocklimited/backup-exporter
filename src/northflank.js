@@ -49,29 +49,15 @@ export function createNorthflankClient(
 
   return {
     async listBackups(projectId, addonId) {
-      const backups = []
-      const seenCursors = new Set()
-      let cursor
-      for (let page = 1; page <= 1000; page++) {
-        const query = new URLSearchParams({ per_page: '100' })
-        if (cursor) query.set('cursor', cursor)
-        else query.set('page', String(page))
-        const result = await get(
-          `${addonPath(projectId, addonId)}?${query}`,
-          `list backups for ${projectId}/${addonId} (page ${page})`
-        )
-        if (!Array.isArray(result.data?.backups)) {
-          throw new Error('Northflank backup list is missing backups')
-        }
-        backups.push(...result.data.backups)
-        if (!result.pagination?.hasNextPage) return backups
-        cursor = result.pagination.cursor
-        if (cursor && seenCursors.has(cursor)) {
-          throw new Error('Northflank returned a repeated pagination cursor')
-        }
-        if (cursor) seenCursors.add(cursor)
+      const query = new URLSearchParams({ per_page: '100', page: '1' })
+      const result = await get(
+        `${addonPath(projectId, addonId)}?${query}`,
+        `list backups for ${projectId}/${addonId} (page 1)`
+      )
+      if (!Array.isArray(result.data?.backups)) {
+        throw new Error('Northflank backup list is missing backups')
       }
-      throw new Error('Northflank backup pagination exceeded 1000 pages')
+      return result.data.backups
     },
     async downloadLink(projectId, addonId, backupId) {
       const result = await get(
