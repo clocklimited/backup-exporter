@@ -1,6 +1,11 @@
 import { Readable } from 'node:stream'
 import { S3Client } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
+import {
+  validateRecipient,
+  encryptedSizeLimit,
+  encryptStream
+} from './encryption.js'
 
 const MIB = 1024 * 1024
 
@@ -35,6 +40,7 @@ export function readConfig(env) {
     maxBackupAgeHours,
     region: required('S3_REGION'),
     bucket: required('S3_BUCKET'),
+    ageRecipient: validateRecipient(required('AGE_RECIPIENT')),
     credentials: {
       accessKeyId: required('S3_ACCESS_KEY_ID'),
       secretAccessKey: required('S3_SECRET_ACCESS_KEY')
@@ -119,6 +125,7 @@ export function selectBackup(backups, maxAgeHours, now = Date.now()) {
   if (!backup.id) throw new Error('Backup is missing its ID')
   const size = Number(backup.config.size)
   multipartPartSize(size)
+  multipartPartSize(encryptedSizeLimit(size))
   const compression = backup.config.compressionType ?? 'gz'
   if (!['gz', 'zstd'].includes(compression)) {
     throw new Error('Backup has an unsupported compression format')
@@ -134,6 +141,8 @@ export async function exportBackup({
   s3,
   fetchImpl = fetch
 }) {
+  const maxEncryptedSize = encryptedSizeLimit(backup.size)
+  const partSize = multipartPartSize(maxEncryptedSize)
   const response = await fetchImpl(downloadLink, {
     redirect: 'error',
     headers: { 'Accept-Encoding': 'identity' }
@@ -150,19 +159,13 @@ export async function exportBackup({
     throw new Error(`Backup download is invalid (HTTP ${response.status})`)
   }
   const source = Readable.fromWeb(response.body)
-  async function* checkedDownload() {
-    let bytes = 0
-    for await (const chunk of source) {
-      bytes += chunk.length
-      if (bytes > backup.size)
-        throw new Error('Download exceeds the expected backup size')
-      yield chunk
-    }
-    if (bytes !== backup.size) throw new Error('Download is empty or truncated')
-  }
-  const body = Readable.from(checkedDownload())
+  const body = encryptStream(source, {
+    recipient: config.ageRecipient,
+    sourceSize: backup.size,
+    maxBytes: maxEncryptedSize
+  })
   const extension = backup.compression === 'zstd' ? 'zst' : backup.compression
-  const key = [config.projectId, addonId, `${backup.id}.${extension}`]
+  const key = [config.projectId, addonId, `${backup.id}.${extension}.age`]
     .map(encodeURIComponent)
     .join('/')
   try {
@@ -180,13 +183,12 @@ export async function exportBackup({
         }
       },
       queueSize: 2,
-      partSize: multipartPartSize(backup.size),
+      partSize,
       leavePartsOnError: false,
       params: {
         Bucket: config.bucket,
         Key: key,
         Body: body,
-        ContentLength: backup.size,
         ContentType: 'application/octet-stream',
         ChecksumAlgorithm: 'SHA256'
       }

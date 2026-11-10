@@ -1,8 +1,13 @@
-import test from 'node:test'
+import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { delimiter, join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { encryptedSizeLimit } from '../src/encryption.js'
 import { createNorthflankClient } from '../src/northflank.js'
 import {
   readConfig,
@@ -15,6 +20,43 @@ import {
 } from '../src/exporter.js'
 const MIB = 1024 * 1024
 const MAX_OBJECT_SIZE = 5_000_000_000_000
+
+// Disposable test identities only; no production private keys enter the exporter.
+const keyDirectory = mkdtempSync(join(tmpdir(), 'backup-exporter-test-'))
+after(() => rmSync(keyDirectory, { recursive: true, force: true }))
+const identity = execFileSync('age-keygen', [], {
+  stdio: ['ignore', 'pipe', 'pipe']
+})
+const identityPath = join(keyDirectory, 'identity.txt')
+writeFileSync(identityPath, identity, { mode: 0o600 })
+const recipient = execFileSync('age-keygen', ['-y'], {
+  input: identity,
+  encoding: 'utf8'
+}).trim()
+const ageBinary = process.env.PATH.split(delimiter)
+  .map((directory) => join(directory, 'age'))
+  .find(existsSync)
+
+function decrypt(ciphertext, path = identityPath) {
+  return execFileSync(ageBinary, ['--decrypt', '--identity', path], {
+    input: ciphertext,
+    maxBuffer: ciphertext.length + 1024,
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+}
+
+function replaceAge(t, script) {
+  const directory = mkdtempSync(join(keyDirectory, 'age-wrapper-'))
+  if (script)
+    writeFileSync(join(directory, 'age'), `#!${process.execPath}\n${script}`, {
+      mode: 0o700
+    })
+  const original = process.env.PATH
+  process.env.PATH = directory
+  t.after(() => {
+    process.env.PATH = original
+  })
+}
 
 function backup(id = 'native-backup', size = 12, overrides = {}) {
   return {
@@ -40,7 +82,8 @@ const env = {
   S3_BUCKET: 'test-bucket',
   S3_REGION: 'eu-west-1',
   S3_ACCESS_KEY_ID: 'fake-access-key',
-  S3_SECRET_ACCESS_KEY: 'fake-secret-key'
+  S3_SECRET_ACCESS_KEY: 'fake-secret-key',
+  AGE_RECIPIENT: recipient
 }
 const downloadLink = 'https://storage.example.invalid/backup?token=DO-NOT-LOG'
 const json = (value) =>
@@ -169,6 +212,38 @@ test('400 GiB and maximum-size backups remain under the multipart limit', () => 
   }
 })
 
+test('requires a valid native age public key and an available age binary', (t) => {
+  assert.equal(readConfig(env).ageRecipient, recipient)
+  for (const value of [
+    undefined,
+    '',
+    'password',
+    identity.toString(),
+    `${recipient}\n${recipient}`,
+    `age1${'q'.repeat(58)}`
+  ]) {
+    assert.throws(
+      () => readConfig({ ...env, AGE_RECIPIENT: value }),
+      /AGE_RECIPIENT/
+    )
+  }
+  replaceAge(t)
+  assert.throws(() => readConfig(env), /Could not run age/)
+})
+
+test('multipart sizing and maximum object size include encryption overhead', () => {
+  const size = 400 * 1024 ** 3
+  assert.ok(
+    Math.ceil(
+      encryptedSizeLimit(size) / multipartPartSize(encryptedSizeLimit(size))
+    ) <= 9999
+  )
+  assert.throws(
+    () => selectBackup([backup('too-large', MAX_OBJECT_SIZE)], 24),
+    /5 TB/
+  )
+})
+
 test('selects newest completed native backup independent of API order; rejects stale backups', () => {
   const now = Date.now()
   const old = backup('old', 12, {
@@ -294,7 +369,7 @@ test('Northflank download-link errors identify the operation and status without 
   assert.doesNotMatch(logs.join(' '), /fake-token|DO-NOT-LOG/)
 })
 
-test('single upload preserves bytes without read/list permissions or sidecar files', async (t) => {
+test('single upload encrypts to one object that decrypts identically without storage read/list permissions', async (t) => {
   const store = await storage(t)
   const body = Buffer.from('backup-bytes')
   const key = await exportBackup({
@@ -304,8 +379,29 @@ test('single upload preserves bytes without read/list permissions or sidecar fil
     downloadLink,
     fetchImpl: async () => new Response(body)
   })
-  assert.equal(key, 'test-project/mongo/small.zst')
-  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+  assert.equal(key, 'test-project/mongo/small.zst.age')
+  const ciphertext = store.objects.get(`/test-bucket/${key}`)
+  assert.ok(
+    ciphertext
+      .subarray(0, 22)
+      .equals(Buffer.from('age-encryption.org/v1\n').subarray(0, 22))
+  )
+  assert.equal(ciphertext.includes(body), false)
+  assert.deepEqual(decrypt(ciphertext), body)
+  assert.equal(
+    Number(store.requests[0].headers['content-length']),
+    ciphertext.length
+  )
+  const wrongIdentity = join(keyDirectory, 'wrong-identity.txt')
+  writeFileSync(
+    wrongIdentity,
+    execFileSync('age-keygen', [], { stdio: ['ignore', 'pipe', 'pipe'] }),
+    { mode: 0o600 }
+  )
+  assert.throws(() => decrypt(ciphertext, wrongIdentity))
+  const corrupted = Buffer.from(ciphertext)
+  corrupted[corrupted.length - 1] ^= 1
+  assert.throws(() => decrypt(corrupted))
   assert.equal(store.objects.size, 1)
   assert.ok(store.requests.every((request) => request.method === 'PUT'))
   assert.ok(
@@ -317,7 +413,7 @@ test('single upload preserves bytes without read/list permissions or sidecar fil
   )
 })
 
-test('real SDK multipart upload preserves every byte with fixed buffering', async (t) => {
+test('real age and SDK multipart upload decrypts every byte with fixed buffering', async (t) => {
   const store = await storage(t)
   const body = Buffer.alloc(65 * MIB + 17, 42)
   const key = await exportBackup({
@@ -327,7 +423,10 @@ test('real SDK multipart upload preserves every byte with fixed buffering', asyn
     downloadLink,
     fetchImpl: async () => new Response(body)
   })
-  assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+  const ciphertext = store.objects.get(`/test-bucket/${key}`)
+  assert.deepEqual(decrypt(ciphertext), body)
+  assert.ok(ciphertext.length > body.length)
+  assert.ok(ciphertext.length <= encryptedSizeLimit(body.length))
   const parts = store.requests
     .filter((request) => request.url.searchParams.has('partNumber'))
     .sort(
@@ -337,7 +436,7 @@ test('real SDK multipart upload preserves every byte with fixed buffering', asyn
     )
   assert.equal(parts.length, 2)
   assert.equal(parts[0].body.length, 64 * MIB)
-  assert.equal(parts[1].body.length, MIB + 17)
+  assert.equal(parts[1].body.length, ciphertext.length - 64 * MIB)
   assert.equal(store.objects.size, 1)
   assert.equal(
     store.requests.filter(
@@ -370,7 +469,7 @@ for (const [location, options] of [
       downloadLink,
       fetchImpl: async () => new Response(body)
     })
-    assert.deepEqual(store.objects.get(`/test-bucket/${key}`), body)
+    assert.deepEqual(decrypt(store.objects.get(`/test-bucket/${key}`)), body)
     assert.deepEqual(
       store.requests.map((request) => request.method),
       ['POST', 'PUT', 'PUT', 'POST']
@@ -401,6 +500,131 @@ test('HTTP errors, empty downloads and size mismatches never become backup objec
   }
   assert.equal(store.objects.size, 0)
 })
+
+test('gzip backups and age chunk boundaries round trip without changing the source archive', async (t) => {
+  const store = await storage(t)
+  for (const size of [1, 65536, 65537]) {
+    const body = Buffer.alloc(size, 71)
+    const key = await exportBackup({
+      ...store,
+      addonId: 'mongo',
+      backup: backup(`gzip-${size}`, size, { compression: 'gz' }),
+      downloadLink,
+      fetchImpl: async () => new Response(body)
+    })
+    assert.ok(key.endsWith('.gz.age'))
+    assert.deepEqual(decrypt(store.objects.get(`/test-bucket/${key}`)), body)
+  }
+})
+
+test(
+  'an age startup failure never uploads an object',
+  { timeout: 10000 },
+  async (t) => {
+    const store = await storage(t)
+    replaceAge(t)
+    await assert.rejects(
+      exportBackup({
+        ...store,
+        addonId: 'mongo',
+        backup: backup(),
+        downloadLink,
+        fetchImpl: async () => new Response('backup-bytes')
+      })
+    )
+    assert.equal(store.requests.length, 0)
+    assert.equal(store.objects.size, 0)
+  }
+)
+
+for (const size of [12, 65 * MIB]) {
+  test(
+    `age exiting unsuccessfully after stdout closes cannot complete a ${size}-byte backup`,
+    { timeout: 15000 },
+    async (t) => {
+      const store = await storage(t)
+      // Emit genuine age ciphertext, close stdout, then report a process failure.
+      replaceAge(
+        t,
+        `
+      const { spawn } = require('node:child_process')
+      const { closeSync } = require('node:fs')
+      const child = spawn(${JSON.stringify(ageBinary)}, process.argv.slice(2), { stdio: 'inherit' })
+      child.once('error', () => process.exit(1))
+      child.once('close', (code) => {
+        closeSync(1)
+        setTimeout(() => process.exit(code || 23), 50)
+      })
+    `
+      )
+      await assert.rejects(
+        exportBackup({
+          ...store,
+          addonId: 'mongo',
+          backup: backup('age-failed', size),
+          downloadLink,
+          fetchImpl: async () => new Response(Buffer.alloc(size, 42))
+        }),
+        /age encryption failed/
+      )
+      assert.equal(store.objects.size, 0)
+      assert.ok(
+        !store.requests.some(
+          (request) =>
+            request.method === 'POST' &&
+            request.url.searchParams.has('uploadId')
+        )
+      )
+      if (size > 64 * MIB) {
+        assert.ok(store.requests.some((request) => request.method === 'DELETE'))
+      } else {
+        assert.equal(store.requests.length, 0)
+      }
+    }
+  )
+}
+
+test(
+  'an encryptor failure cancels a stalled source',
+  { timeout: 10000 },
+  async (t) => {
+    const store = await storage(t)
+    replaceAge(t, 'process.exit(23)')
+    let controller
+    let cancelled = false
+    const stream = new ReadableStream({
+      start(value) {
+        controller = value
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+    let forcedEnd = false
+    const watchdog = setTimeout(() => {
+      forcedEnd = true
+      controller.error(
+        new Error('Encryption failure did not cancel the download')
+      )
+    }, 2000)
+    try {
+      await assert.rejects(
+        exportBackup({
+          ...store,
+          addonId: 'mongo',
+          backup: backup(),
+          downloadLink,
+          fetchImpl: async () => new Response(stream)
+        })
+      )
+    } finally {
+      clearTimeout(watchdog)
+    }
+    assert.equal(forcedEnd, false)
+    assert.equal(cancelled, true)
+    assert.equal(store.requests.length, 0)
+  }
+)
 
 test('source failure after a part upload aborts multipart and never completes it', async (t) => {
   const store = await storage(t)
@@ -514,7 +738,9 @@ test(
     assert.deepEqual(visited, ['large', 'small'])
     assert.ok(errors.some((message) => message.includes('Denied')))
     assert.deepEqual(
-      store.objects.get('/test-bucket/test-project/small/small.zst'),
+      decrypt(
+        store.objects.get('/test-bucket/test-project/small/small.zst.age')
+      ),
       Buffer.from('abc')
     )
     assert.equal(store.objects.size, 1)
@@ -522,7 +748,7 @@ test(
       (request) => request.method === 'DELETE'
     )
     const nextUpload = store.requests.findIndex((request) =>
-      request.url.pathname.endsWith('/small.zst')
+      request.url.pathname.endsWith('/small.zst.age')
     )
     assert.ok(
       aborted >= 0 && aborted < nextUpload,

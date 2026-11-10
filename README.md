@@ -1,10 +1,10 @@
 # backup-exporter
 
-Streams the latest completed native database backup from each configured Northflank addon to an S3-compatible bucket. It exports existing backups; it does not create them.
+Encrypts the latest completed native database backup from each configured Northflank addon with age and streams it to an S3-compatible bucket. It exports existing backups; it does not create them.
 
 ## Setup
 
-Use Node.js 24 and install dependencies with `npm ci`, or build the included Dockerfile.
+Use Node.js 24, install the `age` command (on Ubuntu: `sudo apt install age`), and install dependencies with `npm ci`. The included Dockerfile installs age automatically.
 
 Set these environment variables, either in the job's secrets or a local `.env` file:
 
@@ -17,7 +17,10 @@ S3_REGION=<bucket-region>
 S3_BUCKET=<bucket-name>
 S3_ACCESS_KEY_ID=<access-key>
 S3_SECRET_ACCESS_KEY=<secret-key>
+AGE_RECIPIENT=<public-key-from-recipient.txt>
 ```
+
+`AGE_RECIPIENT` is required and must be one native X25519 age public key beginning `age1`. Paste the contents of `recipient.txt`, not its filename. The exporter validates the key with age before contacting Northflank. Missing or invalid keys, a missing age binary, or encryption errors fail the export; there is no unencrypted fallback. Never give the exporter a private key or passphrase.
 
 `DATABASE_ADDON_ID` accepts a single addon. If neither addon variable is set, the exporter uses `production-database`. `DATABASE_ADDON_IDS` takes precedence. Omit `S3_ENDPOINT` when using the default AWS S3 endpoint.
 
@@ -41,17 +44,27 @@ Configure private access, versioning, retention and lifecycle rules in the stora
 
 Addons export sequentially. If one fails, the exporter attempts the others and exits with a nonzero status. Enable job failure alerts.
 
-Downloads must return HTTP 200 and match the backup's expected byte size. Uploads use SHA-256 request checksums and stream directly to storage with two buffered parts, starting at 64 MiB each. A 400 GiB backup fits within the multipart limit without loading the full file into memory or writing it to disk.
+Downloads must return HTTP 200 and match the backup's expected byte size. The compressed source is streamed through age without writing it to disk. Each backup becomes one encrypted object. The upload can complete only after the download size check and age process both succeed.
+
+Uploads use SHA-256 request checksums and two buffered parts, starting at 64 MiB each. Part sizing allows for encryption overhead, and the encrypted stream is capped at that bound. The source's byte length is not sent as the ciphertext length. A 400 GiB backup fits within the multipart limit without loading the full file into memory. The encrypted size must fit within the 5 TB object limit.
 
 Objects are stored as:
 
 ```text
-project-id/addon-id/backup-id.gz
+project-id/addon-id/backup-id.gz.age
 ```
 
-Zstandard backups use `.zst`. Re-exporting the same backup uses the same key and creates another version if bucket versioning is enabled.
+Zstandard backups use `.zst.age`. Re-exporting the same backup uses the same object key and creates another version if bucket versioning is enabled. Existing `.gz`/`.zst` objects are unchanged and are not protected by the new client-side key.
 
-To restore, download the required object version and import it with the database's native restore tools. Test an upload and restore on a small database before relying on the job.
+## Restore
+
+Download the required object version to a trusted recovery computer. Decrypt it using the passphrase-protected private key from a custodian's USB, then import the resulting archive with the database's native restore tools:
+
+```sh
+age -d -i /media/usb/offsite-backup-recovery/identity.age -o restored-backup.zst downloaded-backup.zst.age
+```
+
+Choose a new output filename (`-o` overwrites existing files). Enter the passphrase interactively; do not put it in the command or the exporter's environment. Use `.gz` filenames for gzip backups. An unattended restore tester needs separate consideration because giving it a private key adds another recovery and purge dependency. Test a real encrypted export, decryption and database restore before relying on this integration.
 
 ## Development
 
