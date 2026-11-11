@@ -1,4 +1,4 @@
-import { Readable } from 'node:stream'
+import { downloadStream } from './download.js'
 import { S3Client } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import {
@@ -32,7 +32,20 @@ export function readConfig(env) {
   if (!Number.isFinite(maxBackupAgeHours) || maxBackupAgeHours <= 0) {
     throw new Error('BACKUP_MAX_AGE_HOURS must be a positive number')
   }
+  const downloadIdleTimeoutSeconds = Number(
+    env.BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS ?? 300
+  )
+  if (
+    !Number.isInteger(downloadIdleTimeoutSeconds) ||
+    downloadIdleTimeoutSeconds <= 0 ||
+    downloadIdleTimeoutSeconds > 2147483
+  ) {
+    throw new Error(
+      'BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS must be an integer between 1 and 2147483'
+    )
+  }
   return {
+    downloadIdleTimeoutMs: downloadIdleTimeoutSeconds * 1000,
     projectId: required('NF_PROJECT_ID'),
     token: required('BACKUP_EXPORTER_TOKEN'),
     addonIds,
@@ -143,22 +156,12 @@ export async function exportBackup({
 }) {
   const maxEncryptedSize = encryptedSizeLimit(backup.size)
   const partSize = multipartPartSize(maxEncryptedSize)
-  const response = await fetchImpl(downloadLink, {
-    redirect: 'error',
-    headers: { 'Accept-Encoding': 'identity' }
+  const source = await downloadStream({
+    url: downloadLink,
+    size: backup.size,
+    timeoutMs: config.downloadIdleTimeoutMs,
+    fetchImpl
   })
-  const encoding = response.headers.get('content-encoding')
-  const length = response.headers.get('content-length')
-  if (
-    response.status !== 200 ||
-    !response.body ||
-    (encoding && encoding !== 'identity') ||
-    (length !== null && Number(length) !== backup.size)
-  ) {
-    await response.body?.cancel()
-    throw new Error(`Backup download is invalid (HTTP ${response.status})`)
-  }
-  const source = Readable.fromWeb(response.body)
   const body = encryptStream(source, {
     recipient: config.ageRecipient,
     sourceSize: backup.size,

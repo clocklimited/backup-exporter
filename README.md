@@ -44,6 +44,8 @@ Configure private access, versioning, retention and lifecycle rules in the stora
 
 Addons export sequentially. If one fails, the exporter attempts the others and exits with a nonzero status. Enable job failure alerts.
 
+The download times out after five minutes waiting for response headers or the next chunk. Set `BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS` to override this (positive whole seconds). The timer pauses while downstream encryption or upload applies backpressure; it does not limit total transfer duration. A timeout fails that addon, attempts multipart cleanup, and allows the next addon to run. Keep a job runtime limit and incomplete-multipart lifecycle cleanup configured.
+
 Downloads must return HTTP 200 and match the backup's expected byte size. The compressed source is streamed through age without writing it to disk. Each backup becomes one encrypted object. The upload can complete only after the download size check and age process both succeed.
 
 Uploads use SHA-256 request checksums and two buffered parts, starting at 64 MiB each. Part sizing allows for encryption overhead, and the encrypted stream is capped at that bound. The source's byte length is not sent as the ciphertext length. A 400 GiB backup fits within the multipart limit without loading the full file into memory. The encrypted size must fit within the 5 TB object limit.

@@ -212,6 +212,21 @@ test('400 GiB and maximum-size backups remain under the multipart limit', () => 
   }
 })
 
+test('download inactivity timeout defaults to five minutes and accepts whole seconds', () => {
+  assert.equal(readConfig(env).downloadIdleTimeoutMs, 300000)
+  assert.equal(
+    readConfig({ ...env, BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS: '60' })
+      .downloadIdleTimeoutMs,
+    60000
+  )
+  for (const value of ['', '0', '-1', '1.5', 'NaN', '2147484']) {
+    assert.throws(
+      () => readConfig({ ...env, BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS: value }),
+      /BACKUP_DOWNLOAD_IDLE_TIMEOUT_SECONDS/
+    )
+  }
+})
+
 test('requires a valid native age public key and an available age binary', (t) => {
   assert.equal(readConfig(env).ageRecipient, recipient)
   for (const value of [
@@ -777,6 +792,61 @@ test('failed multipart completion fails the export', async (t) => {
   )
   assert.equal(store.objects.size, 0)
 })
+
+test(
+  'download timeout aborts multipart and continues with the next addon',
+  { timeout: 10000 },
+  async (t) => {
+    const store = await storage(t)
+    store.config.addonIds = ['stalled', 'working']
+    store.config.downloadIdleTimeoutMs = 500
+    let cancelled = false
+    const stalled = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65 * MIB))
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+    const errors = []
+    await assert.rejects(
+      exportAddons({
+        ...store,
+        northflank: {
+          listBackups: async (project, addon) => [
+            backup(addon, addon === 'stalled' ? 68 * MIB : 3)
+          ],
+          downloadLink: async (project, addon) =>
+            `https://example.invalid/${addon}`
+        },
+        fetchImpl: async (url) =>
+          new Response(url.endsWith('/stalled') ? stalled : 'abc'),
+        logger: { log() {}, error: (message) => errors.push(message) }
+      }),
+      /stalled/
+    )
+    assert.equal(cancelled, true)
+    assert.ok(
+      errors.some((message) => message.includes('Backup download timed out'))
+    )
+    const abortIndex = store.requests.findIndex(
+      (request) =>
+        request.method === 'DELETE' && request.url.searchParams.has('uploadId')
+    )
+    const nextIndex = store.requests.findIndex((request) =>
+      request.url.pathname.endsWith('/working.zst.age')
+    )
+    assert.ok(abortIndex >= 0 && nextIndex > abortIndex)
+    assert.equal(store.objects.size, 1)
+    assert.deepEqual(
+      decrypt(
+        store.objects.get('/test-bucket/test-project/working/working.zst.age')
+      ),
+      Buffer.from('abc')
+    )
+  }
+)
 
 test('one failed addon does not prevent another export, but the job fails and logs no signed URL', async (t) => {
   const store = await storage(t)
