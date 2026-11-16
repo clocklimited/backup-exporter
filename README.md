@@ -1,6 +1,6 @@
 # backup-exporter
 
-Encrypts the latest completed native database backup found on the first page for each configured Northflank addon with age and streams it to an S3-compatible bucket. It exports existing backups; it does not create them.
+Encrypts the latest completed native database backup found on the first page for each configured Northflank addon with age and streams it to an S3-compatible bucket. By default it exports existing backups. An opt-in mode creates a fresh native dump before exporting.
 
 ## Setup
 
@@ -24,7 +24,7 @@ AGE_RECIPIENT=<public-key-from-recipient.txt>
 
 `DATABASE_ADDON_ID` accepts a single addon. If neither addon variable is set, the exporter uses `production-database`. `DATABASE_ADDON_IDS` takes precedence. Omit `S3_ENDPOINT` when using the default AWS S3 endpoint.
 
-The exporter requests only page 1, with up to 100 backups, and selects the newest completed native backup from those results. It fails if that page contains no eligible backup or the selected backup is more than 24 hours old; it does not search older pages. Set `BACKUP_MAX_AGE_HOURS` to change the age limit, for example `192` for weekly backups.
+The exporter requests only page 1, with up to 50 backups, and selects the newest completed native backup from those results. It fails if that page contains no eligible backup or the selected backup is more than 24 hours old; it does not search older pages. Set `BACKUP_MAX_AGE_HOURS` to change the age limit, for example `192` for weekly backups.
 
 Run with:
 
@@ -39,6 +39,18 @@ Configure native dump backups for each addon, then schedule this job after those
 The Northflank token needs read access to addon backups and their download links. The storage identity needs `s3:PutObject` and `s3:AbortMultipartUpload` on the project's object prefix. It does not need to list, read or delete completed objects.
 
 Configure private access, versioning, retention and lifecycle rules in the storage service. Include a lifecycle rule to clear incomplete multipart uploads that may remain after an interrupted job or failed completion request. The exporter does not change bucket settings or object retention.
+
+## Infrequent full backups
+
+For a single addon that should only be dumped when this job runs, set `BACKUP_CREATE_NATIVE=true`. The job requests one native zstd dump, logs its ID, waits for that exact dump to complete, then uses the normal age-encrypted upload path. It does not use an older backup if creation fails, and it does not need a separate native dump schedule.
+
+The Northflank token additionally needs `Project > Addons > General > Update` for the target addon to create the dump. Scope this permission to the intended project/addon. Wasabi permissions and key custody are unchanged.
+
+`BACKUP_CREATION_TIMEOUT_SECONDS` defaults to 14400 (four hours). The Northflank job deadline must allow time for both dump creation and upload. Keep `runOnSourceChange=never`, `concurrencyPolicy=forbid` and automatic retries disabled so rebuilds and automatic retry attempts do not create extra large dumps. Manual runs ignore Northflank's concurrency policy: check that no dump/export is active before triggering one.
+
+On failure, inspect the logged dump ID. Set `BACKUP_ID=<id>` as a **per-run override** to reuse that exact dump; it takes precedence over `BACKUP_CREATE_NATIVE`, and polls it if still running. The regular freshness check still applies. A creation request timeout is ambiguous: check Northflank for a dump that may already have started before retrying. No native or offsite backups are deleted by this mode. Manual native dumps need a separately agreed cleanup policy; do not assume they inherit a deleted schedule's retention.
+
+For Tigers, `10 6 16 2,5,8,11 *` runs at 06:10 UTC on 16 February, May, August and November. It is quarterly, not an exact 90-day interval. Enable job failure notifications in Northflank before relying on unattended runs; this exporter itself does not send alerts.
 
 ## Behaviour
 

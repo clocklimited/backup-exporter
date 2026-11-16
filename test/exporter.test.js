@@ -280,7 +280,7 @@ test('selects newest completed native backup independent of API order; rejects s
   assert.throws(() => selectBackup([old], 24, now + 25 * 3600000), /older than/)
 })
 
-test('Northflank lists only the first 100 backups even when another page exists', async () => {
+test('Northflank lists only the first 50 backups even when another page exists', async () => {
   const calls = []
   const nf = createNorthflankClient('fake-token', async (url, options) => {
     calls.push(new URL(url))
@@ -297,7 +297,7 @@ test('Northflank lists only the first 100 backups even when another page exists'
     ['first-page']
   )
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].searchParams.get('per_page'), '100')
+  assert.equal(calls[0].searchParams.get('per_page'), '50')
   assert.equal(calls[0].searchParams.get('page'), '1')
   assert.equal(calls[0].searchParams.has('cursor'), false)
   const expiredAt = Date.parse(backups[0].createdAt) + 25 * 3600000
@@ -874,4 +874,119 @@ test('one failed addon does not prevent another export, but the job fails and lo
   assert.ok(
     !safeError(new Error(`Failed ${downloadLink}`)).includes('DO-NOT-LOG')
   )
+})
+
+test('native creation is opt-in, requires one addon, and validates retry settings', () => {
+  assert.equal(readConfig(env).createNative, false)
+  assert.equal(
+    readConfig({ ...env, BACKUP_CREATE_NATIVE: 'true' }).createNative,
+    true
+  )
+  assert.throws(
+    () => readConfig({ ...env, BACKUP_CREATE_NATIVE: 'yes' }),
+    /must be true or false/
+  )
+  assert.throws(
+    () =>
+      readConfig({
+        ...env,
+        BACKUP_CREATE_NATIVE: 'true',
+        DATABASE_ADDON_IDS: 'a,b'
+      }),
+    /exactly one addon/
+  )
+  assert.throws(
+    () =>
+      readConfig({ ...env, BACKUP_ID: 'backup', DATABASE_ADDON_IDS: 'a,b' }),
+    /exactly one addon/
+  )
+  assert.throws(
+    () => readConfig({ ...env, BACKUP_ID: '../backup' }),
+    /Northflank backup ID/
+  )
+  for (const value of ['0', '-1', '0.5', 'NaN']) {
+    assert.throws(
+      () => readConfig({ ...env, BACKUP_CREATION_TIMEOUT_SECONDS: value }),
+      /positive whole number/
+    )
+  }
+})
+
+test('creates and exports the exact new dump through real encryption; retry ID avoids another creation', async (t) => {
+  const store = await storage(t)
+  store.config.addonIds = ['darkroom']
+  store.config.createNative = true
+  const calls = []
+  const northflank = {
+    createBackup: async () => {
+      calls.push('create')
+      return 'new-dump'
+    },
+    getBackup: async (project, addon, id) => {
+      calls.push(`get:${id}`)
+      return backup(id, 3)
+    },
+    downloadLink: async (project, addon, id) => {
+      calls.push(`download:${id}`)
+      return downloadLink
+    },
+    listBackups: async () => {
+      throw new Error('must not select an older backup')
+    }
+  }
+  await exportAddons({
+    ...store,
+    northflank,
+    fetchImpl: async () => new Response('abc'),
+    logger: { log() {}, error() {} }
+  })
+  assert.deepEqual(calls, ['create', 'get:new-dump', 'download:new-dump'])
+  assert.deepEqual(
+    decrypt(
+      store.objects.get('/test-bucket/test-project/darkroom/new-dump.zst.age')
+    ),
+    Buffer.from('abc')
+  )
+  calls.length = 0
+  store.config.backupId = 'retry-dump'
+  await exportAddons({
+    ...store,
+    northflank,
+    fetchImpl: async () => new Response('abc'),
+    logger: { log() {}, error() {} }
+  })
+  assert.deepEqual(calls, ['get:retry-dump', 'download:retry-dump'])
+  assert.deepEqual(
+    decrypt(
+      store.objects.get('/test-bucket/test-project/darkroom/retry-dump.zst.age')
+    ),
+    Buffer.from('abc')
+  )
+})
+
+test('failed native dump cannot fall back to exporting an older dump', async (t) => {
+  const store = await storage(t)
+  store.config.addonIds = ['darkroom']
+  store.config.createNative = true
+  const northflank = {
+    createBackup: async () => 'failed-dump',
+    getBackup: async () => backup('failed-dump', 3, { status: 'failed' }),
+    listBackups: async () => {
+      throw new Error('must not fall back')
+    },
+    downloadLink: async () => {
+      throw new Error('must not download')
+    }
+  }
+  const errors = []
+  await assert.rejects(
+    exportAddons({
+      ...store,
+      northflank,
+      logger: { log() {}, error: (e) => errors.push(e) }
+    }),
+    /Export failed for: darkroom/
+  )
+  assert.ok(errors.some((e) => e.includes('ended with status failed')))
+  assert.equal(store.objects.size, 0)
 })

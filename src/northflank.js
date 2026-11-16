@@ -5,12 +5,15 @@ export function createNorthflankClient(
   fetchImpl = fetch,
   logger = console
 ) {
-  async function get(path, operation) {
+  async function request(path, operation, body) {
     logger.log(`Northflank: ${operation}`)
     let response
     try {
       response = await fetchImpl(`${API}${path}`, {
+        method: body ? 'POST' : 'GET',
+        body: body ? JSON.stringify(body) : undefined,
         headers: {
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
           Authorization: `Bearer ${token}`,
           Accept: 'application/json'
         },
@@ -48,9 +51,30 @@ export function createNorthflankClient(
   }
 
   return {
+    async createBackup(projectId, addonId) {
+      const result = await request(
+        addonPath(projectId, addonId),
+        `create native backup for ${projectId}/${addonId}`,
+        { backupType: 'dump', compressionType: 'zstd' }
+      )
+      if (typeof result.data?.id !== 'string' || !result.data.id) {
+        throw new Error('Northflank did not return the created backup ID')
+      }
+      return result.data.id
+    },
+    async getBackup(projectId, addonId, backupId) {
+      const result = await request(
+        `${addonPath(projectId, addonId)}/${encodeURIComponent(backupId)}`,
+        `get backup ${backupId} for ${projectId}/${addonId}`
+      )
+      if (result.data?.id !== backupId) {
+        throw new Error('Northflank returned a different backup ID')
+      }
+      return result.data
+    },
     async listBackups(projectId, addonId) {
-      const query = new URLSearchParams({ per_page: '100', page: '1' })
-      const result = await get(
+      const query = new URLSearchParams({ per_page: '50', page: '1' })
+      const result = await request(
         `${addonPath(projectId, addonId)}?${query}`,
         `list backups for ${projectId}/${addonId} (page 1)`
       )
@@ -60,7 +84,7 @@ export function createNorthflankClient(
       return result.data.backups
     },
     async downloadLink(projectId, addonId, backupId) {
-      const result = await get(
+      const result = await request(
         `${addonPath(projectId, addonId)}/${encodeURIComponent(backupId)}/download-link`,
         `get backup download link for ${projectId}/${addonId}`
       )
