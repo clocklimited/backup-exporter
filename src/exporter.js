@@ -1,4 +1,5 @@
 import { downloadStream } from './download.js'
+import { waitForNativeBackup } from './native-backup.js'
 import { S3Client } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import {
@@ -24,6 +25,30 @@ export function readConfig(env) {
   if (addonIds.some((id) => !/^[a-zA-Z0-9-]+$/.test(id))) {
     throw new Error('DATABASE_ADDON_IDS must contain comma-separated addon IDs')
   }
+  const createNativeValue = env.BACKUP_CREATE_NATIVE?.trim() || 'false'
+  if (!['true', 'false'].includes(createNativeValue)) {
+    throw new Error('BACKUP_CREATE_NATIVE must be true or false')
+  }
+  const createNative = createNativeValue === 'true'
+  const backupId = env.BACKUP_ID?.trim() || undefined
+  if (backupId && !/^[a-zA-Z0-9-]+$/.test(backupId)) {
+    throw new Error('BACKUP_ID must be a Northflank backup ID')
+  }
+  if ((createNative || backupId) && addonIds.length !== 1) {
+    throw new Error('Creating or selecting a backup requires exactly one addon')
+  }
+  const backupCreationTimeoutSeconds = Number(
+    env.BACKUP_CREATION_TIMEOUT_SECONDS ?? 14400
+  )
+  if (
+    !Number.isInteger(backupCreationTimeoutSeconds) ||
+    backupCreationTimeoutSeconds <= 0 ||
+    backupCreationTimeoutSeconds > 2147483
+  ) {
+    throw new Error(
+      'BACKUP_CREATION_TIMEOUT_SECONDS must be a positive whole number within the timer limit'
+    )
+  }
   const endpoint = env.S3_ENDPOINT?.trim() || undefined
   if (endpoint && new URL(endpoint).protocol !== 'https:') {
     throw new Error('S3_ENDPOINT must use HTTPS')
@@ -45,6 +70,9 @@ export function readConfig(env) {
     )
   }
   return {
+    createNative,
+    backupId,
+    backupCreationTimeoutMs: backupCreationTimeoutSeconds * 1000,
     downloadIdleTimeoutMs: downloadIdleTimeoutSeconds * 1000,
     projectId: required('NF_PROJECT_ID'),
     token: required('BACKUP_EXPORTER_TOKEN'),
@@ -214,7 +242,27 @@ export async function exportAddons({
   const failures = []
   for (const addonId of config.addonIds) {
     try {
-      const backups = await northflank.listBackups(config.projectId, addonId)
+      let backups
+      if (config.createNative || config.backupId) {
+        const backupId =
+          config.backupId ||
+          (await northflank.createBackup(config.projectId, addonId))
+        logger.log(
+          `Native backup ${config.projectId}/${addonId}/${backupId}; use BACKUP_ID=${backupId} to retry this dump without creating another`
+        )
+        backups = [
+          await waitForNativeBackup({
+            northflank,
+            projectId: config.projectId,
+            addonId,
+            backupId,
+            timeoutMs: config.backupCreationTimeoutMs,
+            logger
+          })
+        ]
+      } else {
+        backups = await northflank.listBackups(config.projectId, addonId)
+      }
       const backup = selectBackup(backups, config.maxBackupAgeHours)
       logger.log(
         `Exporting ${config.projectId}/${addonId}: ${backup.id}, ${backup.size} bytes`
